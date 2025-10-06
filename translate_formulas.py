@@ -14,6 +14,8 @@ import re as _re
 from openpyxl import load_workbook
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
 
+from formula_parser import FormulaNode, FormulaParseError, parse_formula
+
 TARGET_FUNCTIONS = ("SUMIFS", "COUNTIFS")
 
 
@@ -22,6 +24,8 @@ class FormulaCell:
     sheet: str
     address: str
     formula: str
+    ast: Optional[FormulaNode] = None
+    parse_error: Optional[str] = None
 
 
 @dataclass
@@ -87,7 +91,21 @@ def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]
                     if text:
                         headers[column_letter] = text
                 if getattr(cell, "data_type", None) == "f" and isinstance(value, str):
-                    formulas.append(FormulaCell(sheet_name, coordinate, value))
+                    ast: Optional[FormulaNode] = None
+                    parse_error: Optional[str] = None
+                    try:
+                        ast = parse_formula(value)
+                    except FormulaParseError as exc:
+                        parse_error = str(exc)
+                    formulas.append(
+                        FormulaCell(
+                            sheet=sheet_name,
+                            address=coordinate,
+                            formula=value,
+                            ast=ast,
+                            parse_error=parse_error,
+                        )
+                    )
         header_map[sheet_name] = headers
         cell_values[sheet_name] = values
 
@@ -677,6 +695,8 @@ def write_formula_module(
         call = translation.call
         identifier = _sanitize_identifier(cell.sheet, cell.address, existing)
         lines.append(f"# {cell.sheet}!{cell.address}: {call.raw_text}")
+        if cell.parse_error:
+            lines.append(f"# WARNING: parse error -> {cell.parse_error}")
         for warning in translation.warnings:
             lines.append(f"# NOTE: {warning}")
         if translation.expression:
