@@ -1,12 +1,13 @@
-"""Extract COUNTIFS and SUMIFS formulas from Excel workbooks."""
+"""Translate COUNTIFS and SUMIFS formulas into Pandas snippets."""
 from __future__ import annotations
 
 import argparse
 import re
-from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from openpyxl import load_workbook
+from openpyxl.utils.cell import column_index_from_string, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 TARGET_FUNCTIONS = ("SUMIFS", "COUNTIFS")
@@ -17,6 +18,7 @@ class FormulaCell:
     sheet: str
     address: str
     formula: str
+    worksheet: Worksheet
 
 
 @dataclass
@@ -30,12 +32,27 @@ class FunctionCall:
         return f"{self.func_name}({', '.join(self.args)})"
 
 
+@dataclass
+class FilterExpression:
+    sheet: str
+    expression: str
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Translation:
+    cell: FormulaCell
+    call: FunctionCall
+    expression: Optional[str]
+    warnings: List[str] = field(default_factory=list)
+
+
 def iter_formula_cells(ws: Worksheet) -> Iterator[FormulaCell]:
     """Yield every formula cell in a worksheet."""
     for row in ws.iter_rows(values_only=False):
         for cell in row:
             if cell.data_type == "f" and isinstance(cell.value, str):
-                yield FormulaCell(ws.title, cell.coordinate, cell.value)
+                yield FormulaCell(ws.title, cell.coordinate, cell.value, ws)
 
 
 def strip_array_braces(formula: str) -> str:
@@ -149,26 +166,373 @@ def _extract_function_call(formula: str, start: int, name_len: int) -> tuple[str
     return None, idx
 
 
-def walk_workbook(path: str) -> Iterable[tuple[FormulaCell, Sequence[FunctionCall]]]:
-    workbook = load_workbook(path, data_only=False, read_only=False)
+def build_header_map(workbook) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, Dict[str, str]] = {}
+    for ws in workbook.worksheets:
+        header: Dict[str, str] = {}
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=False), None)
+        if header_row:
+            for cell in header_row:
+                value = cell.value
+                if value is None or str(value).strip() == "":
+                    continue
+                header[cell.column_letter] = str(value)
+        mapping[ws.title] = header
+    return mapping
+
+
+def df_reference(sheet: str) -> str:
+    return f"dfs[{sheet!r}]"
+
+
+def split_range_reference(reference: str, default_sheet: str) -> Optional[Tuple[str, str]]:
+    token = reference.strip()
+    if not token:
+        return None
+    sheet = default_sheet
+    if "!" not in token:
+        return sheet, token
+    if token[0] == "'":
+        idx = 1
+        builder: List[str] = []
+        while idx < len(token):
+            ch = token[idx]
+            if ch == "'":
+                if idx + 1 < len(token) and token[idx + 1] == "'":
+                    builder.append("'")
+                    idx += 2
+                    continue
+                idx += 1
+                break
+            builder.append(ch)
+            idx += 1
+        sheet = "".join(builder)
+        if idx < len(token) and token[idx] == "!":
+            idx += 1
+        ref_part = token[idx:]
+        return sheet, ref_part
+    sheet_part, ref_part = token.split("!", 1)
+    return sheet_part, ref_part
+
+
+COL_RE = re.compile(r"^([A-Z]+)(\d+)?$", re.IGNORECASE)
+CELL_RE = re.compile(r"^([A-Z]+)(\d+)$", re.IGNORECASE)
+
+
+def range_columns(range_token: str) -> Optional[List[str]]:
+    token = range_token.replace("$", "")
+    if "[" in token:
+        return None
+    if ":" in token:
+        left, right = token.split(":", 1)
+    else:
+        left = right = token
+    left_match = COL_RE.match(left)
+    right_match = COL_RE.match(right)
+    if not left_match or not right_match:
+        return None
+    start_idx = column_index_from_string(left_match.group(1))
+    end_idx = column_index_from_string(right_match.group(1))
+    if start_idx > end_idx:
+        start_idx, end_idx = end_idx, start_idx
+    return [get_column_letter(idx) for idx in range(start_idx, end_idx + 1)]
+
+
+def range_to_column(
+    range_ref: str,
+    header_map: Dict[str, Dict[str, str]],
+    default_sheet: str,
+) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
+    parsed = split_range_reference(range_ref, default_sheet)
+    if not parsed:
+        return None, f"Could not parse range reference: {range_ref!r}"
+    sheet, ref = parsed
+    columns = range_columns(ref)
+    if not columns:
+        return None, f"Unsupported range reference: {range_ref}"
+    if len(columns) != 1:
+        return None, f"Only single-column ranges are supported (saw {range_ref})"
+    column_letter = columns[0]
+    header = header_map.get(sheet, {}).get(column_letter)
+    column_name = header if header is not None else column_letter
+    return (sheet, column_name), None
+
+
+def resolve_cell_reference(
+    token: str,
+    workbook,
+    default_sheet: str,
+) -> Tuple[bool, Optional[object]]:
+    parsed = split_range_reference(token, default_sheet)
+    if not parsed:
+        return False, None
+    sheet, ref = parsed
+    if ":" in ref:
+        return False, None
+    cleaned = ref.replace("$", "")
+    cell_match = CELL_RE.match(cleaned)
+    if not cell_match:
+        return False, None
+    sheet_name = sheet
+    if sheet_name not in workbook.sheetnames:
+        return False, None
+    ws = workbook[sheet_name]
+    try:
+        value = ws[cleaned].value
+    except ValueError:
+        return False, None
+    return True, value
+
+
+def coerce_literal(text: str) -> object:
+    stripped = text.strip()
+    if stripped.upper() in {"TRUE", "FALSE"}:
+        return stripped.upper() == "TRUE"
+    if stripped == "":
+        return ""
+    try:
+        if "." in stripped:
+            return float(stripped)
+        return int(stripped)
+    except ValueError:
+        return stripped
+
+
+def format_literal(value: object) -> str:
+    if isinstance(value, str):
+        return repr(value)
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return repr(value)
+
+
+OPERATOR_MAP = [
+    ("<>", "!="),
+    (">=", ">="),
+    ("<=", "<="),
+    (">", ">"),
+    ("<", "<"),
+    ("=", "=="),
+]
+
+NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def contains_wildcard(text: str) -> bool:
+    return any(ch in text for ch in ("*", "?"))
+
+
+def wildcard_to_regex(pattern: str) -> str:
+    regex_parts: List[str] = ["^"]
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            regex_parts.append(".*")
+        elif ch == "?":
+            regex_parts.append(".")
+        else:
+            regex_parts.append(re.escape(ch))
+        i += 1
+    regex_parts.append("$")
+    return "".join(regex_parts)
+
+
+def build_filter_from_operator(lhs: str, op: str, payload: str) -> Tuple[Optional[str], List[str], Optional[str]]:
+    warnings: List[str] = []
+    if contains_wildcard(payload):
+        if op not in {"==", "!="}:
+            return None, warnings, f"Wildcards with operator {op} are not supported"
+        regex = wildcard_to_regex(payload)
+        expr = f"{lhs}.astype(str).str.match({regex!r})"
+        if op == "!=":
+            expr = f"~({expr})"
+        return expr, warnings, None
+    literal = coerce_literal(payload)
+    if literal == "" and op == "!=":
+        expr = f"~({lhs}.isna() | ({lhs} == \"\"))"
+        return expr, warnings, None
+    return f"{lhs} {op} {format_literal(literal)}", warnings, None
+
+
+def build_filter_expression(
+    lhs: str,
+    criteria: str,
+    workbook,
+    default_sheet: str,
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    crit = criteria.strip()
+    warnings: List[str] = []
+    if not crit:
+        return None, warnings, "Empty criteria"
+    if "&" in crit:
+        return None, warnings, "Concatenated criteria are not supported"
+    if crit.startswith('"') and crit.endswith('"'):
+        inner = crit[1:-1]
+        for token, py_op in OPERATOR_MAP:
+            if inner.startswith(token):
+                remainder = inner[len(token) :]
+                expr, extra_warnings, error = build_filter_from_operator(lhs, py_op, remainder)
+                warnings.extend(extra_warnings)
+                return expr, warnings, error
+        expr, extra_warnings, error = build_filter_from_operator(lhs, "==", inner)
+        warnings.extend(extra_warnings)
+        return expr, warnings, error
+    if NUMBER_RE.match(crit):
+        return f"{lhs} == {coerce_literal(crit)}", warnings, None
+    matched, value = resolve_cell_reference(crit, workbook, default_sheet)
+    if matched:
+        return f"{lhs} == {format_literal(value)}", warnings, None
+    if crit.upper() in {"TRUE", "FALSE"}:
+        literal = "True" if crit.upper() == "TRUE" else "False"
+        return f"{lhs} == {literal}", warnings, None
+    return None, warnings, f"Unsupported criteria: {criteria}"
+
+
+def to_filter_expr(
+    range_ref: str,
+    criteria: str,
+    workbook,
+    header_map: Dict[str, Dict[str, str]],
+    default_sheet: str,
+) -> Tuple[Optional[FilterExpression], Optional[str]]:
+    range_result, error = range_to_column(range_ref, header_map, default_sheet)
+    if error:
+        return None, error
+    sheet, column_name = range_result
+    lhs = f"{df_reference(sheet)}[{column_name!r}]"
+    expression, warnings, crit_error = build_filter_expression(lhs, criteria, workbook, default_sheet)
+    if crit_error:
+        return None, crit_error
+    return FilterExpression(sheet, expression, warnings), None
+
+
+def combine_filters(filters: List[FilterExpression]) -> str:
+    if not filters:
+        return "slice(None)"
+    joined = " & ".join(f"({flt.expression})" for flt in filters)
+    return joined
+
+
+def build_sumifs_translation(
+    cell: FormulaCell,
+    call: FunctionCall,
+    workbook,
+    header_map: Dict[str, Dict[str, str]],
+) -> Tuple[Optional[str], List[str]]:
+    warnings: List[str] = []
+    if not call.args:
+        return None, ["SUMIFS requires at least a sum range"]
+    sum_range = call.args[0]
+    sum_result, error = range_to_column(sum_range, header_map, cell.sheet)
+    if error:
+        return None, [error]
+    sum_sheet, sum_column = sum_result
+    criteria_args = call.args[1:]
+    if len(criteria_args) % 2 != 0:
+        return None, ["SUMIFS expects range/criteria pairs"]
+    filters: List[FilterExpression] = []
+    for range_ref, criteria in zip(criteria_args[::2], criteria_args[1::2]):
+        filt, filt_error = to_filter_expr(range_ref, criteria, workbook, header_map, cell.sheet)
+        if filt_error:
+            return None, [filt_error]
+        if filt is None:
+            return None, ["Failed to build filter expression"]
+        if filt.sheet != sum_sheet:
+            return None, [
+                "Cross-sheet SUMIFS criteria are not supported in this translator",
+            ]
+        warnings.extend(filt.warnings)
+        filters.append(filt)
+    df_ref = df_reference(sum_sheet)
+    if filters:
+        mask_expr = combine_filters(filters)
+        rows_expr = f"{df_ref}.loc[{mask_expr}]"
+        expression = f"{rows_expr}[{sum_column!r}].sum()"
+    else:
+        expression = f"{df_ref}[{sum_column!r}].sum()"
+    return expression, warnings
+
+
+def build_countifs_translation(
+    cell: FormulaCell,
+    call: FunctionCall,
+    workbook,
+    header_map: Dict[str, Dict[str, str]],
+) -> Tuple[Optional[str], List[str]]:
+    warnings: List[str] = []
+    if not call.args or len(call.args) % 2 != 0:
+        return None, ["COUNTIFS expects an even number of arguments"]
+    first_range = call.args[0]
+    base_result, error = range_to_column(first_range, header_map, cell.sheet)
+    if error:
+        return None, [error]
+    base_sheet, _ = base_result
+    filters: List[FilterExpression] = []
+    for range_ref, criteria in zip(call.args[::2], call.args[1::2]):
+        filt, filt_error = to_filter_expr(range_ref, criteria, workbook, header_map, cell.sheet)
+        if filt_error:
+            return None, [filt_error]
+        if filt is None:
+            return None, ["Failed to build filter expression"]
+        if filt.sheet != base_sheet:
+            return None, [
+                "Cross-sheet COUNTIFS criteria are not supported in this translator",
+            ]
+        warnings.extend(filt.warnings)
+        filters.append(filt)
+    mask_expr = combine_filters(filters)
+    df_ref = df_reference(base_sheet)
+    expression = f"{df_ref}.loc[{mask_expr}].shape[0]"
+    return expression, warnings
+
+
+def translate_call(
+    cell: FormulaCell,
+    call: FunctionCall,
+    workbook,
+    header_map: Dict[str, Dict[str, str]],
+) -> Translation:
+    if call.func_name == "SUMIFS":
+        expression, warnings = build_sumifs_translation(cell, call, workbook, header_map)
+    else:
+        expression, warnings = build_countifs_translation(cell, call, workbook, header_map)
+    return Translation(cell, call, expression, warnings)
+
+
+def translate_workbook(workbook) -> Iterator[Translation]:
+    header_map = build_header_map(workbook)
     for ws in workbook.worksheets:
         for cell in iter_formula_cells(ws):
             calls = find_target_calls(cell.formula)
-            if calls:
-                yield cell, calls
+            for call in calls:
+                yield translate_call(cell, call, workbook, header_map)
 
 
-def main(argv: Sequence[str]) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workbook", help="Path to the Excel workbook to inspect")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(list(argv) if argv is not None else None)
 
-    for cell, calls in walk_workbook(args.workbook):
-        print(f"{cell.sheet}!{cell.address} -> {cell.formula}")
-        for call in calls:
-            print(f"  found {call.raw_text}")
+    workbook = load_workbook(args.workbook, data_only=False, read_only=False)
+    found = False
+    for translation in translate_workbook(workbook):
+        found = True
+        cell = translation.cell
+        call = translation.call
+        print(f"{cell.sheet}!{cell.address}: {call.raw_text}")
+        if translation.expression:
+            print(f"  pandas -> {translation.expression}")
+        else:
+            print("  pandas -> <unable to build translation>")
+        for warning in translation.warnings:
+            print(f"  note   -> {warning}")
+    if not found:
+        print("No COUNTIFS or SUMIFS formulas found.")
     return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main(None))
+    raise SystemExit(main())
