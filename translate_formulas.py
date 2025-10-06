@@ -102,6 +102,13 @@ def split_top_level_args(arg_string: str) -> List[str]:
     return parts
 
 
+def parse_string_literal(token: str) -> Optional[str]:
+    if len(token) < 2 or not token.startswith('"') or not token.endswith('"'):
+        return None
+    inner = token[1:-1]
+    return inner.replace('""', '"')
+
+
 _identifier_tail = re.compile(r"[A-Z0-9_\.]", re.IGNORECASE)
 
 
@@ -308,6 +315,14 @@ def format_literal(value: object) -> str:
     return repr(value)
 
 
+def excel_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return str(value)
+
+
 OPERATOR_MAP = [
     ("<>", "!="),
     (">=", ">="),
@@ -357,6 +372,104 @@ def build_filter_from_operator(lhs: str, op: str, payload: str) -> Tuple[Optiona
     return f"{lhs} {op} {format_literal(literal)}", warnings, None
 
 
+def split_concat_tokens(expr: str) -> List[str]:
+    parts: List[str] = []
+    token: List[str] = []
+    depth = 0
+    in_string = False
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch == '"':
+            token.append(ch)
+            if in_string:
+                if i + 1 < len(expr) and expr[i + 1] == '"':
+                    token.append('"')
+                    i += 2
+                    continue
+                in_string = False
+                i += 1
+                continue
+            in_string = True
+            i += 1
+            continue
+        if not in_string:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(depth - 1, 0)
+            elif ch == "&" and depth == 0:
+                parts.append("".join(token).strip())
+                token.clear()
+                i += 1
+                continue
+        token.append(ch)
+        i += 1
+    if token:
+        parts.append("".join(token).strip())
+    return parts
+
+
+def evaluate_concat_token(
+    token: str,
+    workbook,
+    default_sheet: str,
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    warnings: List[str] = []
+    stripped = token.strip()
+    if stripped == "":
+        return "", warnings, None
+    literal = parse_string_literal(stripped)
+    if literal is not None:
+        return literal, warnings, None
+    if NUMBER_RE.match(stripped):
+        return str(coerce_literal(stripped)), warnings, None
+    upper = stripped.upper()
+    if upper in {"TRUE", "FALSE"}:
+        return ("TRUE" if upper == "TRUE" else "FALSE"), warnings, None
+    matched, value = resolve_cell_reference(stripped, workbook, default_sheet)
+    if matched:
+        return excel_text(value), warnings, None
+    return None, warnings, f"Unsupported concatenation token: {token}"
+
+
+def try_evaluate_concat(
+    expr: str,
+    workbook,
+    default_sheet: str,
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    tokens = split_concat_tokens(expr)
+    if len(tokens) <= 1:
+        return None, [], None
+    warnings: List[str] = []
+    pieces: List[str] = []
+    for token in tokens:
+        value, token_warnings, error = evaluate_concat_token(token, workbook, default_sheet)
+        warnings.extend(token_warnings)
+        if error:
+            return None, warnings, error
+        if value is None:
+            return None, warnings, f"Unable to evaluate concatenation token: {token}"
+        pieces.append(value)
+    return "".join(pieces), warnings, None
+
+
+def build_filter_expression_from_string(
+    lhs: str,
+    value: str,
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    warnings: List[str] = []
+    for token, py_op in OPERATOR_MAP:
+        if value.startswith(token):
+            remainder = value[len(token) :]
+            expr, extra_warnings, error = build_filter_from_operator(lhs, py_op, remainder)
+            warnings.extend(extra_warnings)
+            return expr, warnings, error
+    expr, extra_warnings, error = build_filter_from_operator(lhs, "==", value)
+    warnings.extend(extra_warnings)
+    return expr, warnings, error
+
+
 def build_filter_expression(
     lhs: str,
     criteria: str,
@@ -367,17 +480,17 @@ def build_filter_expression(
     warnings: List[str] = []
     if not crit:
         return None, warnings, "Empty criteria"
-    if "&" in crit:
-        return None, warnings, "Concatenated criteria are not supported"
-    if crit.startswith('"') and crit.endswith('"'):
-        inner = crit[1:-1]
-        for token, py_op in OPERATOR_MAP:
-            if inner.startswith(token):
-                remainder = inner[len(token) :]
-                expr, extra_warnings, error = build_filter_from_operator(lhs, py_op, remainder)
-                warnings.extend(extra_warnings)
-                return expr, warnings, error
-        expr, extra_warnings, error = build_filter_from_operator(lhs, "==", inner)
+    concat_value, concat_warnings, concat_error = try_evaluate_concat(crit, workbook, default_sheet)
+    warnings.extend(concat_warnings)
+    if concat_error:
+        return None, warnings, concat_error
+    if concat_value is not None:
+        expr, extra_warnings, error = build_filter_expression_from_string(lhs, concat_value)
+        warnings.extend(extra_warnings)
+        return expr, warnings, error
+    literal = parse_string_literal(crit)
+    if literal is not None:
+        expr, extra_warnings, error = build_filter_expression_from_string(lhs, literal)
         warnings.extend(extra_warnings)
         return expr, warnings, error
     if NUMBER_RE.match(crit):
@@ -440,10 +553,6 @@ def build_sumifs_translation(
             return None, [filt_error]
         if filt is None:
             return None, ["Failed to build filter expression"]
-        if filt.sheet != sum_sheet:
-            return None, [
-                "Cross-sheet SUMIFS criteria are not supported in this translator",
-            ]
         warnings.extend(filt.warnings)
         filters.append(filt)
     df_ref = df_reference(sum_sheet)
@@ -477,10 +586,6 @@ def build_countifs_translation(
             return None, [filt_error]
         if filt is None:
             return None, ["Failed to build filter expression"]
-        if filt.sheet != base_sheet:
-            return None, [
-                "Cross-sheet COUNTIFS criteria are not supported in this translator",
-            ]
         warnings.extend(filt.warnings)
         filters.append(filt)
     mask_expr = combine_filters(filters)
