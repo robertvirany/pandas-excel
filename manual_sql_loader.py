@@ -1,29 +1,26 @@
-"""Simple helper to run user-supplied SQL files through pyodbc and pandas.
+"""Create a pandas SQL loader module from user-supplied .sql files.
 
-Usage checklist
-----------------
-1. Drop your SQL text files into a directory (for example, ``sql/``).
-   Name them however you like; the filename (without ``.sql``) becomes the
-   default query key when using the ``--directory`` option.
-2. Fill in ``CONNECTION_STRING`` below with your ODBC details (Netezza, etc.),
-   or pass ``--connection-string`` on the command line.
-3. Either list query files explicitly in ``QUERY_FILES`` or point the script at
-   a directory of ``.sql`` files with ``--directory path/to/sql``.
-4. Run ``python manual_sql_loader.py`` to execute the queries. The script prints
-   a short summary and can optionally write each DataFrame out as a CSV.
+Workflow
+========
+1. Drop your SQL files into a directory (for example, ``sql/``). The filename
+   (minus ``.sql``) becomes the query key when using ``--directory``.
+2. Set ``CONNECTION_STRING`` below with your ODBC details (Netezza, etc.), or
+   pass ``--connection-string`` when running this script to bake a default into
+   the generated module.
+3. Either populate ``QUERY_FILES`` or use ``--directory`` to pick up every
+   ``.sql`` file automatically.
+4. Run ``python manual_sql_loader.py``. A ready-to-import module (default:
+   ``generated_sql_loader.py``) will be written next to your SQL files with
+   `pd.read_sql` calls for each query.
 
-This script does **not** attempt to read SQL out of the workbook; it simply
-executes whatever you provide.
+No attempt is made to extract SQL from the Excel workbook—this tool simply
+packages the SQL you provide.
 """
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Tuple
-
-import pandas as pd
-import pyodbc
+from typing import Dict, Iterable, Mapping
 
 # ---------------------------------------------------------------------------
 # User configuration
@@ -33,12 +30,16 @@ import pyodbc
 CONNECTION_STRING: str = ""
 
 # Explicit mapping of query name -> SQL file path. Paths are resolved relative
-# to this script unless they are absolute. You can keep this empty and rely on
-# the --directory flag instead.
+# to this script unless they are absolute. Leave empty and rely on --directory
+# if you prefer to scan a folder of .sql files automatically.
 QUERY_FILES: Mapping[str, str] = {
     # "submissions": "sql/submissions.sql",
     # "other_query": "sql/other_query.sql",
 }
+
+# Destination for the generated loader module (relative to the current working
+# directory when the script is run if not absolute).
+OUTPUT_PATH: Path = Path("generated_sql_loader.py")
 
 # ---------------------------------------------------------------------------
 
@@ -76,36 +77,6 @@ def read_sql_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def load_queries(
-    connection_string: str,
-    query_files: Mapping[str, Path],
-    *,
-    autocommit: bool = True,
-) -> Dict[str, pd.DataFrame]:
-    if not connection_string:
-        raise ValueError("Connection string is empty; set CONNECTION_STRING or pass --connection-string.")
-    if not query_files:
-        raise ValueError("No queries provided. Configure QUERY_FILES or use --directory.")
-
-    statements: Dict[str, str] = {}
-    for name, path in query_files.items():
-        sql_text = read_sql_file(path)
-        statements[name] = sql_text
-
-    results: Dict[str, pd.DataFrame] = {}
-    with closing(pyodbc.connect(connection_string, autocommit=autocommit)) as conn:
-        for name, sql in statements.items():
-            results[name] = pd.read_sql(sql, conn)
-    return results
-
-
-def save_results(dfs: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for name, df in dfs.items():
-        output_path = output_dir / f"{name}.csv"
-        df.to_csv(output_path, index=False)
-
-
 def build_query_map(args: argparse.Namespace) -> Dict[str, Path]:
     if args.directory:
         directory = args.directory
@@ -119,7 +90,7 @@ def build_query_map(args: argparse.Namespace) -> Dict[str, Path]:
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Execute user-provided SQL files with pyodbc and pandas.")
+    parser = argparse.ArgumentParser(description="Generate a pandas loader module from SQL files.")
     parser.add_argument(
         "--connection-string",
         dest="connection_string",
@@ -148,24 +119,47 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List discovered queries without executing them.",
+        help="List discovered queries without generating code.",
     )
     parser.add_argument(
-        "--output-dir",
+        "--output",
         type=Path,
-        help="Optional directory to write query results as CSV files.",
-    )
-    parser.add_argument(
-        "--no-autocommit",
-        action="store_true",
-        help="Disable autocommit on the ODBC connection.",
-    )
-    parser.add_argument(
-        "--summary-only",
-        action="store_true",
-        help="Print DataFrame shapes only; skip saving results unless --output-dir is set.",
+        help="Destination .py file for the generated loader (default: generated_sql_loader.py).",
     )
     return parser.parse_args(argv)
+
+
+def generate_loader_code(queries: Mapping[str, str], connection_string: str) -> str:
+    lines: list[str] = []
+    lines.append('"""Auto-generated SQL loader generated by manual_sql_loader.py."""')
+    lines.append("import pandas as pd")
+    lines.append("import pyodbc")
+    lines.append("from contextlib import closing")
+    lines.append("")
+    if connection_string:
+        lines.append(f"CONNECTION_STRING = {connection_string!r}")
+    else:
+        lines.append("CONNECTION_STRING = ''  # TODO: populate with your ODBC connection string")
+    lines.append("")
+    lines.append("QUERIES = {")
+    for name, sql in queries.items():
+        lines.append(f"    {name!r}: {sql!r},")
+    lines.append("}")
+    lines.append("")
+    lines.append("def load_data(connection_string: str | None = None, autocommit: bool = True) -> dict:")
+    lines.append("    \"\"\"Return a dict mapping query names to pandas DataFrames.\"\"\"")
+    lines.append("    conn_str = connection_string or CONNECTION_STRING")
+    lines.append("    if not conn_str:")
+    lines.append("        raise ValueError('Provide a connection string or set CONNECTION_STRING before calling load_data.')")
+    lines.append("    results = {}")
+    lines.append("    with closing(pyodbc.connect(conn_str, autocommit=autocommit)) as conn:")
+    lines.append("        for name, sql in QUERIES.items():")
+    lines.append("            results[name] = pd.read_sql(sql, conn)")
+    lines.append("    return results")
+    lines.append("")
+    lines.append("__all__ = ['QUERIES', 'load_data', 'CONNECTION_STRING']")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -177,31 +171,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
 
     if args.list:
-        print("Queries ready for execution:")
+        print("Queries ready for inclusion:")
         for name, path in sorted(query_map.items()):
             print(f"  {name}: {path}")
         return 0
 
-    connection_string = args.connection_string or CONNECTION_STRING
-    try:
-        results = load_queries(
-            connection_string,
-            query_map,
-            autocommit=not args.no_autocommit,
-        )
-    except Exception as exc:  # pragma: no cover - CLI surface area
-        print(f"Error: {exc}")
-        return 2
+    statements: Dict[str, str] = {}
+    for name, path in query_map.items():
+        statements[name] = read_sql_file(path)
 
-    if args.output_dir:
-        save_results(results, args.output_dir)
-        print(f"Saved results to {args.output_dir}")
+    output_path = args.output or OUTPUT_PATH
+    if not output_path.is_absolute():
+        output_path = Path.cwd() / output_path
 
-    if not args.summary_only or not args.output_dir:
-        print("Query execution summary:")
-        for name, df in results.items():
-            print(f"  {name}: {df.shape[0]} rows, {df.shape[1]} columns")
-
+    code = generate_loader_code(statements, args.connection_string or CONNECTION_STRING)
+    output_path.write_text(code, encoding="utf-8")
+    print(f"Generated SQL loader written to {output_path}")
+    print(f"Included queries: {', '.join(sorted(statements))}")
     return 0
 
 

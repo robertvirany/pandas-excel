@@ -4,7 +4,11 @@ from __future__ import annotations
 import argparse
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import keyword
+import re as _re
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
@@ -631,26 +635,77 @@ def translate_workbook(
             yield translate_call(cell, call, context, header_map)
 
 
+_identifier_re = _re.compile(r"[^0-9a-zA-Z_]+")
+
+
+def _sanitize_identifier(sheet: str, address: str, existing: set[str]) -> str:
+    base = f"{sheet}_{address}".lower()
+    base = base.replace("!", "_")
+    base = _identifier_re.sub("_", base)
+    if not base:
+        base = "formula"
+    if base[0].isdigit():
+        base = f"cell_{base}"
+    if keyword.iskeyword(base):
+        base = f"formula_{base}"
+    candidate = base
+    counter = 1
+    while candidate in existing:
+        counter += 1
+        candidate = f"{base}_{counter}"
+    existing.add(candidate)
+    return candidate
+
+
+def write_formula_module(
+    translations: List[Translation],
+    output_path: Path,
+    workbook_name: str,
+) -> None:
+    existing: set[str] = set()
+    lines: List[str] = []
+    lines.append(f'"""Auto-generated pandas formulas from {workbook_name}."""')
+    lines.append("")
+    lines.append("# Expect a dict-like object `dfs` mapping sheet names to pandas DataFrames.")
+    lines.append("# You can import this module and evaluate each expression after preparing `dfs`.")
+    lines.append("")
+
+    for translation in translations:
+        cell = translation.cell
+        call = translation.call
+        identifier = _sanitize_identifier(cell.sheet, cell.address, existing)
+        lines.append(f"# {cell.sheet}!{cell.address}: {call.raw_text}")
+        for warning in translation.warnings:
+            lines.append(f"# NOTE: {warning}")
+        if translation.expression:
+            lines.append(f"{identifier} = {translation.expression}")
+        else:
+            lines.append("# Unable to translate this formula into pandas code.")
+        lines.append("")
+
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workbook", help="Path to the Excel workbook to inspect")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("generated_formulas.py"),
+        help="Destination .py file for the generated pandas code",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     context, formulas = load_workbook_context(args.workbook)
-    found = False
-    for translation in translate_workbook(context, formulas):
-        found = True
-        cell = translation.cell
-        call = translation.call
-        print(f"{cell.sheet}!{cell.address}: {call.raw_text}")
-        if translation.expression:
-            print(f"  pandas -> {translation.expression}")
-        else:
-            print("  pandas -> <unable to build translation>")
-        for warning in translation.warnings:
-            print(f"  note   -> {warning}")
-    if not found:
+    translations = list(translate_workbook(context, formulas))
+    if not translations:
         print("No COUNTIFS or SUMIFS formulas found.")
+        return 0
+
+    output_path = args.output if args.output.is_absolute() else Path.cwd() / args.output
+    write_formula_module(translations, output_path, Path(args.workbook).name)
+    print(f"Generated pandas formulas written to {output_path}")
     return 0
 
 
