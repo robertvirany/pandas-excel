@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -667,7 +668,8 @@ def write_formula_module(
     lines.append(f'"""Auto-generated pandas formulas from {workbook_name}."""')
     lines.append("")
     lines.append("# Expect a dict-like object `dfs` mapping sheet names to pandas DataFrames.")
-    lines.append("# You can import this module and evaluate each expression after preparing `dfs`.")
+    lines.append("# Example: dfs = {'Sales': sales_df, 'Summary': summary_df}")
+    lines.append("# Evaluate these expressions after populating `dfs` to obtain the metrics.")
     lines.append("")
 
     for translation in translations:
@@ -695,9 +697,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=Path("generated_formulas.py"),
         help="Destination .py file for the generated pandas code",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress information while processing the workbook.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     context, formulas = load_workbook_context(args.workbook)
+    if args.verbose:
+        if not formulas:
+            print("No COUNTIFS or SUMIFS formulas found in the workbook.")
+        else:
+            counts = Counter(cell.sheet for cell in formulas)
+            total = sum(counts.values())
+            print(f"Discovered {total} target formula cell(s) across {len(counts)} sheet(s):")
+            for sheet, count in counts.items():
+                print(f"  {sheet}: {count}")
+
     translations = list(translate_workbook(context, formulas))
     if not translations:
         print("No COUNTIFS or SUMIFS formulas found.")
@@ -705,6 +722,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     output_path = args.output if args.output.is_absolute() else Path.cwd() / args.output
     write_formula_module(translations, output_path, Path(args.workbook).name)
+    if args.verbose:
+        print("Generated expressions:")
+        for translation in translations:
+            status = "ok" if translation.expression else "skipped"
+            print(f"  {translation.cell.sheet}!{translation.cell.address} ({translation.call.func_name}) -> {status}")
     print(f"Generated pandas formulas written to {output_path}")
     return 0
 
