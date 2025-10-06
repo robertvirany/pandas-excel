@@ -5,18 +5,33 @@ import argparse
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import keyword
+import math
+import operator
 import re as _re
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
+from openpyxl.utils.datetime import from_excel
 
-from formula_parser import FormulaNode, FormulaParseError, parse_formula
-
-TARGET_FUNCTIONS = ("SUMIFS", "COUNTIFS")
+from formula_parser import (
+    BinaryOpNode,
+    BooleanNode,
+    ErrorNode,
+    FormulaNode,
+    FormulaParseError,
+    FunctionNode,
+    NameNode,
+    NumberNode,
+    ReferenceNode,
+    StringNode,
+    UnaryOpNode,
+    parse_formula,
+)
 
 
 @dataclass
@@ -33,9 +48,9 @@ class FunctionCall:
     func_name: str
     args: List[str]
     raw_text: str
-    offset: int
+    offset: int = 0
 
-    def __str__(self) -> str:  # pragma: no cover - for debugging
+    def __str__(self) -> str:  # pragma: no cover - debugging helper
         return f"{self.func_name}({', '.join(self.args)})"
 
 
@@ -49,22 +64,28 @@ class FilterExpression:
 @dataclass
 class Translation:
     cell: FormulaCell
-    call: FunctionCall
     expression: Optional[str]
     warnings: List[str] = field(default_factory=list)
+    imports: set[str] = field(default_factory=set)
+
+
+@dataclass
+class TranslatorState:
+    cell: FormulaCell
+    context: WorkbookContext
+    header_map: Dict[str, Dict[str, str]]
+    warnings: List[str]
+    imports: set[str]
 
 
 @dataclass
 class WorkbookContext:
     header_map: Dict[str, Dict[str, str]]
     cell_values: Dict[str, Dict[str, object]]
-def strip_array_braces(formula: str) -> str:
-    text = formula.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return text[1:-1]
-    return text
 
 
+class TranslationError(Exception):
+    """Raised when a formula cannot be translated into Python code."""
 def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]]:
     workbook = load_workbook(
         path,
@@ -113,46 +134,6 @@ def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]
     return WorkbookContext(header_map, cell_values), formulas
 
 
-def split_top_level_args(arg_string: str) -> List[str]:
-    """Split a comma-delimited argument string without breaking nested calls."""
-    parts: List[str] = []
-    token: List[str] = []
-    depth = 0
-    in_string = False
-    i = 0
-    while i < len(arg_string):
-        ch = arg_string[i]
-        if ch == '"':
-            token.append(ch)
-            if in_string:
-                # Excel escapes quotes by doubling them
-                if i + 1 < len(arg_string) and arg_string[i + 1] == '"':
-                    token.append('"')
-                    i += 2
-                    continue
-                in_string = False
-                i += 1
-                continue
-            in_string = True
-            i += 1
-            continue
-        if not in_string:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth = max(depth - 1, 0)
-            elif ch == "," and depth == 0:
-                parts.append("".join(token).strip())
-                token.clear()
-                i += 1
-                continue
-        token.append(ch)
-        i += 1
-    if token:
-        parts.append("".join(token).strip())
-    return parts
-
-
 def parse_string_literal(token: str) -> Optional[str]:
     if len(token) < 2 or not token.startswith('"') or not token.endswith('"'):
         return None
@@ -160,68 +141,6 @@ def parse_string_literal(token: str) -> Optional[str]:
     return inner.replace('""', '"')
 
 
-_identifier_tail = re.compile(r"[A-Z0-9_\.]", re.IGNORECASE)
-
-
-def find_target_calls(formula: str) -> List[FunctionCall]:
-    """Locate COUNTIFS/SUMIFS calls within a formula string."""
-    cleaned = strip_array_braces(formula)
-    upper = cleaned.upper()
-    calls: List[FunctionCall] = []
-    i = 0
-    while i < len(cleaned):
-        matched_name = None
-        for name in TARGET_FUNCTIONS:
-            upper_name = name
-            if upper.startswith(upper_name, i):
-                prev_idx = i - 1
-                if prev_idx >= 0 and _identifier_tail.match(upper[prev_idx]):
-                    continue
-                next_idx = i + len(name)
-                if next_idx >= len(cleaned) or cleaned[next_idx] != "(":
-                    continue
-                matched_name = name
-                break
-        if not matched_name:
-            i += 1
-            continue
-        call_text, end_idx = _extract_function_call(cleaned, i, len(matched_name))
-        if call_text is None:
-            i += len(matched_name)
-            continue
-        func_name = matched_name
-        arg_segment = call_text[len(func_name) + 1 : -1]
-        args = split_top_level_args(arg_segment)
-        calls.append(FunctionCall(func_name, args, call_text, i))
-        i = end_idx
-    return calls
-
-
-def _extract_function_call(formula: str, start: int, name_len: int) -> tuple[str | None, int]:
-    idx = start + name_len
-    if idx >= len(formula) or formula[idx] != "(":
-        return None, idx
-    idx += 1
-    depth = 1
-    in_string = False
-    while idx < len(formula):
-        ch = formula[idx]
-        if ch == '"':
-            if in_string and idx + 1 < len(formula) and formula[idx + 1] == '"':
-                idx += 2
-                continue
-            in_string = not in_string
-            idx += 1
-            continue
-        if not in_string:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    return formula[start : idx + 1], idx + 1
-        idx += 1
-    return None, idx
 
 
 def df_reference(sheet: str) -> str:
@@ -348,6 +267,8 @@ def format_literal(value: object) -> str:
         return "None"
     if isinstance(value, bool):
         return "True" if value else "False"
+    if isinstance(value, (datetime, date)):
+        return repr(value.isoformat())
     return repr(value)
 
 
@@ -357,6 +278,29 @@ def excel_text(value: object) -> str:
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     return str(value)
+
+
+def normalize_cell_address(address: str) -> str:
+    return address.replace("$", "").upper()
+
+
+def reference_is_range(reference: str) -> bool:
+    if ':' in reference:
+        return True
+    # Column-only references like "A:A" or "Sheet!A:A"
+    cleaned = reference.replace('$', '')
+    return not any(ch.isdigit() for ch in cleaned)
+
+
+def resolve_scalar_reference(node: ReferenceNode, state: TranslatorState) -> object:
+    if reference_is_range(node.reference):
+        raise TranslationError(f"Range reference {node.original!r} cannot be used as a scalar")
+    sheet = node.sheet or state.cell.sheet
+    address = normalize_cell_address(node.reference)
+    values = state.context.cell_values.get(sheet)
+    if values is None or address not in values:
+        raise TranslationError(f"Unable to resolve cell reference {node.original!r}")
+    return values[address]
 
 
 OPERATOR_MAP = [
@@ -373,6 +317,147 @@ NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 
 def contains_wildcard(text: str) -> bool:
     return any(ch in text for ch in ("*", "?"))
+
+
+def range_node_to_string(node: FormulaNode, state: TranslatorState) -> str:
+    if isinstance(node, ReferenceNode):
+        return node.original
+    raise TranslationError("Expected a range reference")
+
+
+def criteria_node_to_string(node: FormulaNode, state: TranslatorState) -> str:
+    literal = try_evaluate_literal(node, state)
+    if literal is not None:
+        if isinstance(literal, str):
+            return f'"{literal}"'
+        return excel_text(literal)
+    if isinstance(node, StringNode):
+        return f'"{node.value}"'
+    if isinstance(node, NumberNode):
+        return node.text or str(node.value)
+    if isinstance(node, BooleanNode):
+        return "TRUE" if node.value else "FALSE"
+    if isinstance(node, UnaryOpNode) and not node.postfix and node.operator in {'+', '-'}:
+        operand = criteria_node_to_string(node.operand, state)
+        return f"{node.operator}{operand}"
+    if isinstance(node, BinaryOpNode) and node.operator == '&':
+        left = criteria_node_to_string(node.left, state)
+        right = criteria_node_to_string(node.right, state)
+        return left + right
+    raise TranslationError("Unsupported criteria expression")
+
+
+def try_evaluate_literal(node: FormulaNode, state: TranslatorState) -> Optional[object]:
+    try:
+        return evaluate_literal(node, state)
+    except TranslationError:
+        return None
+
+
+def evaluate_literal(node: FormulaNode, state: TranslatorState) -> object:
+    if isinstance(node, NumberNode):
+        if node.text and node.text.isdigit():
+            return int(node.text)
+        if node.value.is_integer():
+            return int(node.value)
+        return node.value
+    if isinstance(node, StringNode):
+        return node.value
+    if isinstance(node, BooleanNode):
+        return node.value
+    if isinstance(node, ReferenceNode):
+        return resolve_scalar_reference(node, state)
+    if isinstance(node, UnaryOpNode):
+        operand = evaluate_literal(node.operand, state)
+        if node.postfix:
+            if node.operator == '%':
+                return operand / 100
+            raise TranslationError(f"Unsupported postfix operator {node.operator!r}")
+        if node.operator == '+':
+            return +operand
+        if node.operator == '-':
+            return -operand
+        raise TranslationError(f"Unsupported unary operator {node.operator!r}")
+    if isinstance(node, BinaryOpNode):
+        left = evaluate_literal(node.left, state)
+        right = evaluate_literal(node.right, state)
+        op = node.operator
+        if op == '+':
+            return left + right
+        if op == '-':
+            return left - right
+        if op == '*':
+            return left * right
+        if op == '/':
+            return left / right
+        if op == '^':
+            return math.pow(left, right)
+        if op == '&':
+            return f"{left}{right}"
+        if op in {'=', '<>', '<', '>', '<=', '>='}:
+            ops = {
+                '=': operator.eq,
+                '<>': operator.ne,
+                '<': operator.lt,
+                '>': operator.gt,
+                '<=': operator.le,
+                '>=': operator.ge,
+            }
+            return ops[op](left, right)
+        raise TranslationError(f"Unsupported binary operator {op!r}")
+    if isinstance(node, FunctionNode):
+        name = node.name.upper()
+        if name == 'EOMONTH':
+            if len(node.args) != 2:
+                raise TranslationError("EOMONTH requires two arguments")
+            start = to_datetime_value(evaluate_literal(node.args[0], state))
+            months = int(evaluate_literal(node.args[1], state))
+            return eomonth(start, months)
+        if name == 'YEAR':
+            dt = to_datetime_value(evaluate_literal(node.args[0], state))
+            return dt.year
+        if name == 'MONTH':
+            dt = to_datetime_value(evaluate_literal(node.args[0], state))
+            return dt.month
+        if name == 'IF':
+            if len(node.args) < 2:
+                raise TranslationError("IF requires at least two arguments")
+            condition = evaluate_literal(node.args[0], state)
+            if condition:
+                return evaluate_literal(node.args[1], state)
+            if len(node.args) >= 3:
+                return evaluate_literal(node.args[2], state)
+            return False
+        raise TranslationError(f"Unsupported function {name} for literal evaluation")
+    raise TranslationError(f"Unsupported node type {type(node).__name__}")
+
+
+def to_datetime_value(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, (int, float)):
+        try:
+            return from_excel(value)
+        except TypeError as exc:
+            raise TranslationError(f"Unable to convert Excel serial {value!r} to datetime") from exc
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise TranslationError(f"Unable to parse date string {value!r}") from exc
+    raise TranslationError(f"Unsupported datetime value {value!r}")
+
+
+def eomonth(start: datetime, months: int) -> datetime:
+    month = start.month - 1 + months
+    year = start.year + month // 12
+    month = month % 12 + 1
+    from calendar import monthrange
+
+    last_day = monthrange(year, month)[1]
+    return datetime(year, month, last_day, start.hour, start.minute, start.second)
 
 
 def wildcard_to_regex(pattern: str) -> str:
@@ -630,6 +715,177 @@ def build_countifs_translation(
     return expression, warnings
 
 
+def translate_sumifs_node(node: FunctionNode, state: TranslatorState) -> str:
+    args: List[str] = []
+    for idx, arg in enumerate(node.args):
+        if idx == 0 or idx % 2 == 1:
+            args.append(range_node_to_string(arg, state))
+        else:
+            args.append(criteria_node_to_string(arg, state))
+    call = FunctionCall(func_name='SUMIFS', args=args, raw_text='SUMIFS')
+    expression, warnings = build_sumifs_translation(state.cell, call, state.context, state.header_map)
+    state.warnings.extend(warnings)
+    if expression is None:
+        raise TranslationError("Unable to translate SUMIFS call")
+    return expression
+
+
+def translate_countifs_node(node: FunctionNode, state: TranslatorState) -> str:
+    args: List[str] = []
+    for idx, arg in enumerate(node.args):
+        if idx % 2 == 0:
+            args.append(range_node_to_string(arg, state))
+        else:
+            args.append(criteria_node_to_string(arg, state))
+    call = FunctionCall(func_name='COUNTIFS', args=args, raw_text='COUNTIFS')
+    expression, warnings = build_countifs_translation(state.cell, call, state.context, state.header_map)
+    state.warnings.extend(warnings)
+    if expression is None:
+        raise TranslationError("Unable to translate COUNTIFS call")
+    return expression
+
+
+def translate_if_node(node: FunctionNode, state: TranslatorState) -> str:
+    if len(node.args) < 2:
+        raise TranslationError("IF requires at least two arguments")
+    condition = translate_node(node.args[0], state)
+    true_expr = translate_node(node.args[1], state)
+    if len(node.args) >= 3:
+        false_expr = translate_node(node.args[2], state)
+    else:
+        false_expr = "None"
+    return f"({true_expr}) if ({condition}) else ({false_expr})"
+
+
+def translate_eomonth_node(node: FunctionNode, state: TranslatorState) -> str:
+    literal = try_evaluate_literal(node, state)
+    if literal is not None:
+        return format_literal(literal)
+    raise TranslationError("EOMONTH with dynamic arguments is not supported yet")
+
+
+def translate_year_node(node: FunctionNode, state: TranslatorState) -> str:
+    literal = try_evaluate_literal(node, state)
+    if literal is not None:
+        return format_literal(literal)
+    raise TranslationError("YEAR with dynamic arguments is not supported yet")
+
+
+def translate_month_node(node: FunctionNode, state: TranslatorState) -> str:
+    literal = try_evaluate_literal(node, state)
+    if literal is not None:
+        return format_literal(literal)
+    raise TranslationError("MONTH with dynamic arguments is not supported yet")
+
+
+def translate_index_node(node: FunctionNode, state: TranslatorState) -> str:
+    if not node.args:
+        raise TranslationError("INDEX expects at least one argument")
+    range_str = range_node_to_string(node.args[0], state)
+    range_result, error = range_to_column(range_str, state.header_map, state.cell.sheet)
+    if error:
+        raise TranslationError(error)
+    target_sheet, target_column = range_result
+    target_series = f"{df_reference(target_sheet)}[{target_column!r}]"
+
+    if len(node.args) < 2:
+        raise TranslationError("INDEX requires a row argument")
+    row_arg = node.args[1]
+    if isinstance(row_arg, FunctionNode) and row_arg.name.upper() == 'MATCH':
+        lookup_expr = translate_match_node(row_arg, state)
+        return f"{target_series}.loc[{lookup_expr}].iloc[0]"
+    row_literal = try_evaluate_literal(row_arg, state)
+    if row_literal is None:
+        raise TranslationError("Unsupported INDEX row argument")
+    row_index = int(row_literal) - 1
+    return f"{target_series}.iloc[{row_index}]"
+
+
+def translate_match_node(node: FunctionNode, state: TranslatorState) -> str:
+    if len(node.args) < 2:
+        raise TranslationError("MATCH requires at least two arguments")
+    lookup_value = node.args[0]
+    lookup_range_node = node.args[1]
+    match_type = 0
+    if len(node.args) >= 3:
+        literal = try_evaluate_literal(node.args[2], state)
+        if literal is None:
+            raise TranslationError("Unsupported MATCH type")
+        match_type = int(literal)
+    if match_type != 0:
+        raise TranslationError("Only exact MATCH (type 0) is supported")
+
+    range_str = range_node_to_string(lookup_range_node, state)
+    range_result, error = range_to_column(range_str, state.header_map, state.cell.sheet)
+    if error:
+        raise TranslationError(error)
+    sheet, column = range_result
+    series = f"{df_reference(sheet)}[{column!r}]"
+
+    literal = try_evaluate_literal(lookup_value, state)
+    if literal is not None:
+        value_expr = format_literal(literal)
+    else:
+        value_expr = translate_node(lookup_value, state)
+    return f"({series} == {value_expr})"
+
+
+def translate_node(node: FormulaNode, state: TranslatorState) -> str:
+    if isinstance(node, NumberNode):
+        return node.text or str(node.value)
+    if isinstance(node, StringNode):
+        return repr(node.value)
+    if isinstance(node, BooleanNode):
+        return "True" if node.value else "False"
+    if isinstance(node, ErrorNode):
+        raise TranslationError(f"Error literal {node.value!r} is not supported")
+    if isinstance(node, ReferenceNode):
+        value = resolve_scalar_reference(node, state)
+        return format_literal(value)
+    if isinstance(node, NameNode):
+        raise TranslationError(f"Named ranges are not supported ({node.name})")
+    if isinstance(node, UnaryOpNode):
+        operand = translate_node(node.operand, state)
+        if node.postfix:
+            if node.operator == '%':
+                return f"({operand}) / 100"
+            raise TranslationError(f"Unsupported postfix operator {node.operator!r}")
+        if node.operator in {'+', '-'}:
+            return f"({node.operator}{operand})"
+        raise TranslationError(f"Unsupported unary operator {node.operator!r}")
+    if isinstance(node, BinaryOpNode):
+        left = translate_node(node.left, state)
+        right = translate_node(node.right, state)
+        op = node.operator
+        if op == '^':
+            return f"({left}) ** ({right})"
+        if op == '&':
+            return f"({left}) + ({right})"
+        if op == '=':
+            op = '=='
+        return f"({left}) {op} ({right})"
+    if isinstance(node, FunctionNode):
+        name = node.name.upper()
+        if name == 'SUMIFS':
+            return translate_sumifs_node(node, state)
+        if name == 'COUNTIFS':
+            return translate_countifs_node(node, state)
+        if name == 'IF':
+            return translate_if_node(node, state)
+        if name == 'EOMONTH':
+            return translate_eomonth_node(node, state)
+        if name == 'YEAR':
+            return translate_year_node(node, state)
+        if name == 'MONTH':
+            return translate_month_node(node, state)
+        if name == 'INDEX':
+            return translate_index_node(node, state)
+        if name == 'MATCH':
+            return translate_match_node(node, state)
+        raise TranslationError(f"Unsupported function {name}")
+    raise TranslationError(f"Unsupported node type {type(node).__name__}")
+
+
 def translate_call(
     cell: FormulaCell,
     call: FunctionCall,
@@ -649,9 +905,21 @@ def translate_workbook(
 ) -> Iterator[Translation]:
     header_map = context.header_map
     for cell in formula_cells:
-        calls = find_target_calls(cell.formula)
-        for call in calls:
-            yield translate_call(cell, call, context, header_map)
+        state = TranslatorState(cell=cell, context=context, header_map=header_map, warnings=[], imports=set())
+        if cell.parse_error:
+            state.warnings.append(f"Parse error: {cell.parse_error}")
+            yield Translation(cell=cell, expression=None, warnings=state.warnings, imports=state.imports)
+            continue
+        if cell.ast is None:
+            state.warnings.append("No AST available")
+            yield Translation(cell=cell, expression=None, warnings=state.warnings, imports=state.imports)
+            continue
+        try:
+            expression = translate_node(cell.ast, state)
+        except TranslationError as exc:
+            state.warnings.append(str(exc))
+            expression = None
+        yield Translation(cell=cell, expression=expression, warnings=state.warnings, imports=state.imports)
 
 
 _identifier_re = _re.compile(r"[^0-9a-zA-Z_]+")
@@ -685,6 +953,13 @@ def write_formula_module(
     lines: List[str] = []
     lines.append(f'"""Auto-generated pandas formulas from {workbook_name}."""')
     lines.append("")
+    imports: set[str] = set()
+    for translation in translations:
+        imports.update(translation.imports)
+    if imports:
+        for statement in sorted(imports):
+            lines.append(statement)
+        lines.append("")
     lines.append("# Expect a dict-like object `dfs` mapping sheet names to pandas DataFrames.")
     lines.append("# Example: dfs = {'Sales': sales_df, 'Summary': summary_df}")
     lines.append("# Evaluate these expressions after populating `dfs` to obtain the metrics.")
@@ -692,9 +967,8 @@ def write_formula_module(
 
     for translation in translations:
         cell = translation.cell
-        call = translation.call
         identifier = _sanitize_identifier(cell.sheet, cell.address, existing)
-        lines.append(f"# {cell.sheet}!{cell.address}: {call.raw_text}")
+        lines.append(f"# {cell.sheet}!{cell.address}: {cell.formula}")
         if cell.parse_error:
             lines.append(f"# WARNING: parse error -> {cell.parse_error}")
         for warning in translation.warnings:
@@ -746,7 +1020,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Generated expressions:")
         for translation in translations:
             status = "ok" if translation.expression else "skipped"
-            print(f"  {translation.cell.sheet}!{translation.cell.address} ({translation.call.func_name}) -> {status}")
+            print(f"  {translation.cell.sheet}!{translation.cell.address} -> {status}")
     print(f"Generated pandas formulas written to {output_path}")
     return 0
 
