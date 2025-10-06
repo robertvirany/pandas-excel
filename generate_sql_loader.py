@@ -146,6 +146,58 @@ def read_query_definitions(workbook_path: Path) -> List[ExtractedQuery]:
     return queries
 
 
+def read_connections(workbook_path: Path) -> List[ExtractedQuery]:
+    queries: List[ExtractedQuery] = []
+    try:
+        with zipfile.ZipFile(workbook_path, "r") as archive:
+            data = archive.read("xl/connections.xml")
+    except (KeyError, FileNotFoundError):
+        return queries
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return queries
+
+    def local(tag: str) -> str:
+        return tag.split('}', 1)[-1] if '}' in tag else tag
+
+    for conn in root.iter():
+        if local(conn.tag) != "connection":
+            continue
+        name = conn.get("name") or conn.get("id") or "Connection"
+        db_pr = None
+        for child in conn:
+            if local(child.tag) == "dbPr":
+                db_pr = child
+                break
+        if db_pr is None:
+            continue
+        command = db_pr.get("command")
+        if command is None:
+            db_command = None
+            for sub in db_pr:
+                if local(sub.tag) == "dbCommand":
+                    db_command = sub.text
+                    break
+            if db_command:
+                command = db_command
+        if not command:
+            continue
+        sql_text = command.strip()
+        if not sql_text:
+            continue
+        query = ExtractedQuery(
+            name=name,
+            formula=sql_text,
+            sql_blocks=[sql_text],
+            connection_hints=[db_pr.get("connection")] if db_pr.get("connection") else [],
+            source_part="xl/connections.xml",
+        )
+        queries.append(query)
+    return queries
+
+
 def generate_loader_code(
     queries: Iterable[ExtractedQuery],
     workbook: Path,
@@ -237,6 +289,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     queries = read_query_definitions(args.workbook)
+    queries.extend(read_connections(args.workbook))
     code = generate_loader_code(queries, args.workbook)
     write_loader_file(code, args.output, overwrite=args.overwrite)
 
