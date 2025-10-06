@@ -8,7 +8,6 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
 
 TARGET_FUNCTIONS = ("SUMIFS", "COUNTIFS")
 
@@ -18,7 +17,6 @@ class FormulaCell:
     sheet: str
     address: str
     formula: str
-    worksheet: Worksheet
 
 
 @dataclass
@@ -47,19 +45,49 @@ class Translation:
     warnings: List[str] = field(default_factory=list)
 
 
-def iter_formula_cells(ws: Worksheet) -> Iterator[FormulaCell]:
-    """Yield every formula cell in a worksheet."""
-    for row in ws.iter_rows(values_only=False):
-        for cell in row:
-            if cell.data_type == "f" and isinstance(cell.value, str):
-                yield FormulaCell(ws.title, cell.coordinate, cell.value, ws)
-
-
+@dataclass
+class WorkbookContext:
+    header_map: Dict[str, Dict[str, str]]
+    cell_values: Dict[str, Dict[str, object]]
 def strip_array_braces(formula: str) -> str:
     text = formula.strip()
     if text.startswith("{") and text.endswith("}"):
         return text[1:-1]
     return text
+
+
+def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]]:
+    workbook = load_workbook(
+        path,
+        data_only=False,
+        read_only=True,
+        keep_links=False,
+    )
+    header_map: Dict[str, Dict[str, str]] = {}
+    cell_values: Dict[str, Dict[str, object]] = {}
+    formulas: List[FormulaCell] = []
+
+    for ws in workbook.worksheets:
+        sheet_name = ws.title
+        headers: Dict[str, str] = {}
+        values: Dict[str, object] = {}
+        for row_idx, row in enumerate(ws.iter_rows(values_only=False), start=1):
+            for col_idx, cell in enumerate(row, start=1):
+                column_letter = get_column_letter(col_idx)
+                coordinate = f"{column_letter}{row_idx}".upper()
+                value = cell.value
+                values[coordinate] = value
+                if row_idx == 1 and value is not None:
+                    text = str(value).strip()
+                    if text:
+                        headers[column_letter] = text
+                if getattr(cell, "data_type", None) == "f" and isinstance(value, str):
+                    formulas.append(FormulaCell(sheet_name, coordinate, value))
+        header_map[sheet_name] = headers
+        cell_values[sheet_name] = values
+
+    workbook.close()
+    return WorkbookContext(header_map, cell_values), formulas
 
 
 def split_top_level_args(arg_string: str) -> List[str]:
@@ -173,21 +201,6 @@ def _extract_function_call(formula: str, start: int, name_len: int) -> tuple[str
     return None, idx
 
 
-def build_header_map(workbook) -> Dict[str, Dict[str, str]]:
-    mapping: Dict[str, Dict[str, str]] = {}
-    for ws in workbook.worksheets:
-        header: Dict[str, str] = {}
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=False), None)
-        if header_row:
-            for cell in header_row:
-                value = cell.value
-                if value is None or str(value).strip() == "":
-                    continue
-                header[cell.column_letter] = str(value)
-        mapping[ws.title] = header
-    return mapping
-
-
 def df_reference(sheet: str) -> str:
     return f"dfs[{sheet!r}]"
 
@@ -267,7 +280,7 @@ def range_to_column(
 
 def resolve_cell_reference(
     token: str,
-    workbook,
+    context: WorkbookContext,
     default_sheet: str,
 ) -> Tuple[bool, Optional[object]]:
     parsed = split_range_reference(token, default_sheet)
@@ -281,12 +294,12 @@ def resolve_cell_reference(
     if not cell_match:
         return False, None
     sheet_name = sheet
-    if sheet_name not in workbook.sheetnames:
+    sheet_values = context.cell_values.get(sheet_name)
+    if sheet_values is None:
         return False, None
-    ws = workbook[sheet_name]
-    try:
-        value = ws[cleaned].value
-    except ValueError:
+    key = cleaned.upper()
+    value = sheet_values.get(key)
+    if key not in sheet_values:
         return False, None
     return True, value
 
@@ -412,7 +425,7 @@ def split_concat_tokens(expr: str) -> List[str]:
 
 def evaluate_concat_token(
     token: str,
-    workbook,
+    context: WorkbookContext,
     default_sheet: str,
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
     warnings: List[str] = []
@@ -427,7 +440,7 @@ def evaluate_concat_token(
     upper = stripped.upper()
     if upper in {"TRUE", "FALSE"}:
         return ("TRUE" if upper == "TRUE" else "FALSE"), warnings, None
-    matched, value = resolve_cell_reference(stripped, workbook, default_sheet)
+    matched, value = resolve_cell_reference(stripped, context, default_sheet)
     if matched:
         return excel_text(value), warnings, None
     return None, warnings, f"Unsupported concatenation token: {token}"
@@ -435,7 +448,7 @@ def evaluate_concat_token(
 
 def try_evaluate_concat(
     expr: str,
-    workbook,
+    context: WorkbookContext,
     default_sheet: str,
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
     tokens = split_concat_tokens(expr)
@@ -444,7 +457,7 @@ def try_evaluate_concat(
     warnings: List[str] = []
     pieces: List[str] = []
     for token in tokens:
-        value, token_warnings, error = evaluate_concat_token(token, workbook, default_sheet)
+        value, token_warnings, error = evaluate_concat_token(token, context, default_sheet)
         warnings.extend(token_warnings)
         if error:
             return None, warnings, error
@@ -473,14 +486,14 @@ def build_filter_expression_from_string(
 def build_filter_expression(
     lhs: str,
     criteria: str,
-    workbook,
+    context: WorkbookContext,
     default_sheet: str,
 ) -> Tuple[Optional[str], List[str], Optional[str]]:
     crit = criteria.strip()
     warnings: List[str] = []
     if not crit:
         return None, warnings, "Empty criteria"
-    concat_value, concat_warnings, concat_error = try_evaluate_concat(crit, workbook, default_sheet)
+    concat_value, concat_warnings, concat_error = try_evaluate_concat(crit, context, default_sheet)
     warnings.extend(concat_warnings)
     if concat_error:
         return None, warnings, concat_error
@@ -495,7 +508,7 @@ def build_filter_expression(
         return expr, warnings, error
     if NUMBER_RE.match(crit):
         return f"{lhs} == {coerce_literal(crit)}", warnings, None
-    matched, value = resolve_cell_reference(crit, workbook, default_sheet)
+    matched, value = resolve_cell_reference(crit, context, default_sheet)
     if matched:
         return f"{lhs} == {format_literal(value)}", warnings, None
     if crit.upper() in {"TRUE", "FALSE"}:
@@ -507,7 +520,7 @@ def build_filter_expression(
 def to_filter_expr(
     range_ref: str,
     criteria: str,
-    workbook,
+    context: WorkbookContext,
     header_map: Dict[str, Dict[str, str]],
     default_sheet: str,
 ) -> Tuple[Optional[FilterExpression], Optional[str]]:
@@ -516,7 +529,7 @@ def to_filter_expr(
         return None, error
     sheet, column_name = range_result
     lhs = f"{df_reference(sheet)}[{column_name!r}]"
-    expression, warnings, crit_error = build_filter_expression(lhs, criteria, workbook, default_sheet)
+    expression, warnings, crit_error = build_filter_expression(lhs, criteria, context, default_sheet)
     if crit_error:
         return None, crit_error
     return FilterExpression(sheet, expression, warnings), None
@@ -532,7 +545,7 @@ def combine_filters(filters: List[FilterExpression]) -> str:
 def build_sumifs_translation(
     cell: FormulaCell,
     call: FunctionCall,
-    workbook,
+    context: WorkbookContext,
     header_map: Dict[str, Dict[str, str]],
 ) -> Tuple[Optional[str], List[str]]:
     warnings: List[str] = []
@@ -548,7 +561,7 @@ def build_sumifs_translation(
         return None, ["SUMIFS expects range/criteria pairs"]
     filters: List[FilterExpression] = []
     for range_ref, criteria in zip(criteria_args[::2], criteria_args[1::2]):
-        filt, filt_error = to_filter_expr(range_ref, criteria, workbook, header_map, cell.sheet)
+        filt, filt_error = to_filter_expr(range_ref, criteria, context, header_map, cell.sheet)
         if filt_error:
             return None, [filt_error]
         if filt is None:
@@ -568,7 +581,7 @@ def build_sumifs_translation(
 def build_countifs_translation(
     cell: FormulaCell,
     call: FunctionCall,
-    workbook,
+    context: WorkbookContext,
     header_map: Dict[str, Dict[str, str]],
 ) -> Tuple[Optional[str], List[str]]:
     warnings: List[str] = []
@@ -581,7 +594,7 @@ def build_countifs_translation(
     base_sheet, _ = base_result
     filters: List[FilterExpression] = []
     for range_ref, criteria in zip(call.args[::2], call.args[1::2]):
-        filt, filt_error = to_filter_expr(range_ref, criteria, workbook, header_map, cell.sheet)
+        filt, filt_error = to_filter_expr(range_ref, criteria, context, header_map, cell.sheet)
         if filt_error:
             return None, [filt_error]
         if filt is None:
@@ -597,23 +610,25 @@ def build_countifs_translation(
 def translate_call(
     cell: FormulaCell,
     call: FunctionCall,
-    workbook,
+    context: WorkbookContext,
     header_map: Dict[str, Dict[str, str]],
 ) -> Translation:
     if call.func_name == "SUMIFS":
-        expression, warnings = build_sumifs_translation(cell, call, workbook, header_map)
+        expression, warnings = build_sumifs_translation(cell, call, context, header_map)
     else:
-        expression, warnings = build_countifs_translation(cell, call, workbook, header_map)
+        expression, warnings = build_countifs_translation(cell, call, context, header_map)
     return Translation(cell, call, expression, warnings)
 
 
-def translate_workbook(workbook) -> Iterator[Translation]:
-    header_map = build_header_map(workbook)
-    for ws in workbook.worksheets:
-        for cell in iter_formula_cells(ws):
-            calls = find_target_calls(cell.formula)
-            for call in calls:
-                yield translate_call(cell, call, workbook, header_map)
+def translate_workbook(
+    context: WorkbookContext,
+    formula_cells: Iterable[FormulaCell],
+) -> Iterator[Translation]:
+    header_map = context.header_map
+    for cell in formula_cells:
+        calls = find_target_calls(cell.formula)
+        for call in calls:
+            yield translate_call(cell, call, context, header_map)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -621,9 +636,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("workbook", help="Path to the Excel workbook to inspect")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    workbook = load_workbook(args.workbook, data_only=False, read_only=False)
+    context, formulas = load_workbook_context(args.workbook)
     found = False
-    for translation in translate_workbook(workbook):
+    for translation in translate_workbook(context, formulas):
         found = True
         cell = translation.cell
         call = translation.call
