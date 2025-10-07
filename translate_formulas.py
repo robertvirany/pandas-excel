@@ -1,13 +1,15 @@
 """Translate COUNTIFS and SUMIFS formulas into Pandas snippets."""
+#%% Imports
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import keyword
 import math
@@ -86,7 +88,10 @@ class WorkbookContext:
 
 class TranslationError(Exception):
     """Raised when a formula cannot be translated into Python code."""
-def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]]:
+def load_workbook_context(
+    path: str,
+    progress: Optional[Callable[[str], None]] = None,
+) -> tuple[WorkbookContext, List[FormulaCell]]:
     workbook = load_workbook(
         path,
         data_only=False,
@@ -99,6 +104,8 @@ def load_workbook_context(path: str) -> tuple[WorkbookContext, List[FormulaCell]
 
     for ws in workbook.worksheets:
         sheet_name = ws.title
+        if progress:
+            progress(f"Scanning sheet {sheet_name}...")
         headers: Dict[str, str] = {}
         values: Dict[str, object] = {}
         for row_idx, row in enumerate(ws.iter_rows(values_only=False), start=1):
@@ -902,9 +909,12 @@ def translate_call(
 def translate_workbook(
     context: WorkbookContext,
     formula_cells: Iterable[FormulaCell],
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Iterator[Translation]:
     header_map = context.header_map
     for cell in formula_cells:
+        if progress:
+            progress(f"Translating {cell.sheet}!{cell.address}...")
         state = TranslatorState(cell=cell, context=context, header_map=header_map, warnings=[], imports=set())
         if cell.parse_error:
             state.warnings.append(f"Parse error: {cell.parse_error}")
@@ -918,6 +928,14 @@ def translate_workbook(
             expression = translate_node(cell.ast, state)
         except TranslationError as exc:
             state.warnings.append(str(exc))
+            expression = None
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            error_message = f"Error translating {cell.sheet}!{cell.address}: {exc}"
+            state.warnings.append(error_message)
+            if progress:
+                progress(error_message)
+            else:
+                print(error_message, file=sys.stderr, flush=True)
             expression = None
         yield Translation(cell=cell, expression=expression, warnings=state.warnings, imports=state.imports)
 
@@ -998,32 +1016,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    context, formulas = load_workbook_context(args.workbook)
+    def emit(message: str, *, stream=sys.stdout) -> None:
+        print(message, file=stream, flush=True)
+
+    emit(f"Loading workbook {args.workbook}...")
+    context, formulas = load_workbook_context(args.workbook, progress=emit)
+    emit("Workbook scan complete.")
+
     if args.verbose:
         if not formulas:
-            print("No COUNTIFS or SUMIFS formulas found in the workbook.")
+            emit("No COUNTIFS or SUMIFS formulas found in the workbook.")
         else:
             counts = Counter(cell.sheet for cell in formulas)
             total = sum(counts.values())
-            print(f"Discovered {total} target formula cell(s) across {len(counts)} sheet(s):")
+            emit(f"Discovered {total} target formula cell(s) across {len(counts)} sheet(s):")
             for sheet, count in counts.items():
-                print(f"  {sheet}: {count}")
+                emit(f"  {sheet}: {count}")
 
-    translations = list(translate_workbook(context, formulas))
-    if not translations:
-        print("No COUNTIFS or SUMIFS formulas found.")
+    if not formulas:
+        emit("No COUNTIFS or SUMIFS formulas found.")
         return 0
+
+    emit("Translating formulas...")
+    translations = list(translate_workbook(context, formulas, progress=emit))
+    emit("Finished translating formulas.")
 
     output_path = args.output if args.output.is_absolute() else Path.cwd() / args.output
     write_formula_module(translations, output_path, Path(args.workbook).name)
     if args.verbose:
-        print("Generated expressions:")
+        emit("Generated expressions:")
         for translation in translations:
             status = "ok" if translation.expression else "skipped"
-            print(f"  {translation.cell.sheet}!{translation.cell.address} -> {status}")
-    print(f"Generated pandas formulas written to {output_path}")
+            emit(f"  {translation.cell.sheet}!{translation.cell.address} -> {status}")
+    emit(f"Generated pandas formulas written to {output_path}")
     return 0
 
-
+#%% CLI entry point
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
