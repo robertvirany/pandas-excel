@@ -17,7 +17,8 @@ import operator
 import re as _re
 
 from openpyxl import load_workbook
-from openpyxl.utils.cell import column_index_from_string, get_column_letter
+from openpyxl.formula.translate import Translator
+from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
 from openpyxl.utils.datetime import from_excel
 
 from formula_parser import (
@@ -43,6 +44,8 @@ class FormulaCell:
     formula: str
     ast: Optional[FormulaNode] = None
     parse_error: Optional[str] = None
+    derived_column: Optional[str] = None
+    derived_row_span: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -69,6 +72,8 @@ class Translation:
     expression: Optional[str]
     warnings: List[str] = field(default_factory=list)
     imports: set[str] = field(default_factory=set)
+    output_kind: str = "scalar"
+    target_column_name: Optional[str] = None
 
 
 @dataclass
@@ -78,6 +83,7 @@ class TranslatorState:
     header_map: Dict[str, Dict[str, str]]
     warnings: List[str]
     imports: set[str]
+    mode: str = "cell"
 
 
 @dataclass
@@ -138,7 +144,93 @@ def load_workbook_context(
         cell_values[sheet_name] = values
 
     workbook.close()
-    return WorkbookContext(header_map, cell_values), formulas
+    context = WorkbookContext(header_map, cell_values)
+    formulas = identify_derived_columns(context, formulas)
+    return context, formulas
+
+
+#%% Derived column helpers
+def normalize_formula_for_row(formula: str, origin: str, target_row: int) -> str:
+    _, current_row = split_coordinate(origin)
+    row_delta = target_row - current_row
+    if row_delta == 0:
+        return formula
+    translator = Translator(formula, origin=origin)
+    return translator.translate_formula(row_delta=row_delta, col_delta=0)
+
+
+def can_translate_rowwise(cell: FormulaCell, context: WorkbookContext) -> bool:
+    if cell.ast is None or cell.parse_error:
+        return False
+    state = TranslatorState(
+        cell=cell,
+        context=context,
+        header_map=context.header_map,
+        warnings=[],
+        imports=set(),
+        mode="row",
+    )
+    try:
+        translate_node(cell.ast, state)
+    except TranslationError:
+        return False
+    return True
+
+
+def identify_derived_columns(
+    context: WorkbookContext,
+    formulas: List[FormulaCell],
+) -> List[FormulaCell]:
+    grouped: Dict[Tuple[str, str], List[FormulaCell]] = {}
+    for cell in formulas:
+        column_letter, _ = split_coordinate(cell.address)
+        key = (cell.sheet, column_letter)
+        grouped.setdefault(key, []).append(cell)
+
+    skip: set[Tuple[str, str]] = set()
+    for (sheet, column), cells in grouped.items():
+        if len(cells) < 2:
+            continue
+        sorted_cells = sorted(cells, key=lambda fc: split_coordinate(fc.address)[1])
+        base_cell = sorted_cells[0]
+        base_row = split_coordinate(base_cell.address)[1]
+        try:
+            base_normalized = normalize_formula_for_row(base_cell.formula, base_cell.address, base_row)
+        except Exception:
+            continue
+        uniform = True
+        for other in sorted_cells[1:]:
+            other_row = split_coordinate(other.address)[1]
+            try:
+                normalized = normalize_formula_for_row(other.formula, other.address, base_row)
+            except Exception:
+                uniform = False
+                break
+            if normalized != base_normalized:
+                uniform = False
+                break
+        if not uniform:
+            continue
+        if not can_translate_rowwise(base_cell, context):
+            continue
+        min_row = split_coordinate(sorted_cells[0].address)[1]
+        max_row = split_coordinate(sorted_cells[-1].address)[1]
+        base_cell.derived_column = column
+        base_cell.derived_row_span = (min_row, max_row)
+        for other in sorted_cells[1:]:
+            skip.add((other.sheet, other.address))
+
+    filtered: List[FormulaCell] = []
+    seen: set[Tuple[str, str]] = set()
+    for cell in formulas:
+        key = (cell.sheet, cell.address)
+        if key in skip:
+            continue
+        if cell.derived_column and key in seen:
+            continue
+        seen.add(key)
+        filtered.append(cell)
+    return filtered
 
 
 def parse_string_literal(token: str) -> Optional[str]:
@@ -291,12 +383,45 @@ def normalize_cell_address(address: str) -> str:
     return address.replace("$", "").upper()
 
 
+def split_coordinate(address: str) -> Tuple[str, int]:
+    column, row = coordinate_from_string(address)
+    return column.upper(), row
+
+
 def reference_is_range(reference: str) -> bool:
     if ':' in reference:
         return True
     # Column-only references like "A:A" or "Sheet!A:A"
     cleaned = reference.replace('$', '')
     return not any(ch.isdigit() for ch in cleaned)
+
+
+def reference_details(reference: str) -> Optional[Tuple[str, int, bool, bool]]:
+    token = reference.strip()
+    if not token or ':' in token:
+        return None
+    idx = 0
+    col_relative = True
+    row_relative = True
+    length = len(token)
+    if idx < length and token[idx] == '$':
+        col_relative = False
+        idx += 1
+    col_chars: List[str] = []
+    while idx < length and token[idx].isalpha():
+        col_chars.append(token[idx].upper())
+        idx += 1
+    if not col_chars:
+        return None
+    if idx < length and token[idx] == '$':
+        row_relative = False
+        idx += 1
+    row_chars = token[idx:]
+    if not row_chars or not row_chars.isdigit():
+        return None
+    row_number = int(row_chars)
+    column = ''.join(col_chars)
+    return column, row_number, col_relative, row_relative
 
 
 def resolve_scalar_reference(node: ReferenceNode, state: TranslatorState) -> object:
@@ -373,6 +498,11 @@ def evaluate_literal(node: FormulaNode, state: TranslatorState) -> object:
     if isinstance(node, BooleanNode):
         return node.value
     if isinstance(node, ReferenceNode):
+        if state.mode == "row":
+            details = reference_details(node.reference)
+            target_sheet = node.sheet or state.cell.sheet
+            if details and details[3] and target_sheet == state.cell.sheet:
+                raise TranslationError("Row-relative references cannot be treated as literals in derived columns")
         return resolve_scalar_reference(node, state)
     if isinstance(node, UnaryOpNode):
         operand = evaluate_literal(node.operand, state)
@@ -837,6 +967,22 @@ def translate_match_node(node: FunctionNode, state: TranslatorState) -> str:
     return f"({series} == {value_expr})"
 
 
+def translate_reference_row(node: ReferenceNode, state: TranslatorState) -> str:
+    details = reference_details(node.reference)
+    if details is None:
+        raise TranslationError(f"Unsupported reference {node.original!r} for derived columns")
+    column, _row_number, _col_relative, row_relative = details
+    target_sheet = node.sheet or state.cell.sheet
+    if row_relative:
+        if target_sheet != state.cell.sheet:
+            raise TranslationError("Row-relative references across sheets are not supported for derived columns")
+        header = state.header_map.get(target_sheet, {}).get(column)
+        column_name = header if header is not None else column
+        return f"row[{column_name!r}]"
+    value = resolve_scalar_reference(node, state)
+    return format_literal(value)
+
+
 def translate_node(node: FormulaNode, state: TranslatorState) -> str:
     if isinstance(node, NumberNode):
         return node.text or str(node.value)
@@ -847,6 +993,8 @@ def translate_node(node: FormulaNode, state: TranslatorState) -> str:
     if isinstance(node, ErrorNode):
         raise TranslationError(f"Error literal {node.value!r} is not supported")
     if isinstance(node, ReferenceNode):
+        if state.mode == "row":
+            return translate_reference_row(node, state)
         value = resolve_scalar_reference(node, state)
         return format_literal(value)
     if isinstance(node, NameNode):
@@ -915,7 +1063,15 @@ def translate_workbook(
     for cell in formula_cells:
         if progress:
             progress(f"Translating {cell.sheet}!{cell.address}...")
-        state = TranslatorState(cell=cell, context=context, header_map=header_map, warnings=[], imports=set())
+        mode = "row" if cell.derived_column else "cell"
+        state = TranslatorState(
+            cell=cell,
+            context=context,
+            header_map=header_map,
+            warnings=[],
+            imports=set(),
+            mode=mode,
+        )
         if cell.parse_error:
             state.warnings.append(f"Parse error: {cell.parse_error}")
             yield Translation(cell=cell, expression=None, warnings=state.warnings, imports=state.imports)
@@ -926,6 +1082,22 @@ def translate_workbook(
             continue
         try:
             expression = translate_node(cell.ast, state)
+            if cell.derived_column and expression is not None:
+                df_ref = df_reference(cell.sheet)
+                column_letter = cell.derived_column
+                header = header_map.get(cell.sheet, {}).get(column_letter)
+                column_name = header if header is not None else column_letter
+                series_expr = f"{df_ref}.apply(lambda row: {expression}, axis=1)"
+                expression = series_expr
+                yield Translation(
+                    cell=cell,
+                    expression=expression,
+                    warnings=state.warnings,
+                    imports=state.imports,
+                    output_kind="column",
+                    target_column_name=column_name,
+                )
+                continue
         except TranslationError as exc:
             state.warnings.append(str(exc))
             expression = None
@@ -987,14 +1159,30 @@ def write_formula_module(
         cell = translation.cell
         identifier = _sanitize_identifier(cell.sheet, cell.address, existing)
         lines.append(f"# {cell.sheet}!{cell.address}: {cell.formula}")
+        if cell.derived_column and cell.derived_row_span:
+            start_row, end_row = cell.derived_row_span
+            if start_row == end_row:
+                span_desc = f"row {start_row}"
+            else:
+                span_desc = f"rows {start_row}-{end_row}"
+            lines.append(f"# NOTE: Derived column fill ({span_desc})")
         if cell.parse_error:
             lines.append(f"# WARNING: parse error -> {cell.parse_error}")
         for warning in translation.warnings:
             lines.append(f"# NOTE: {warning}")
-        if translation.expression:
-            lines.append(f"{identifier} = {translation.expression}")
+        if translation.output_kind == "column":
+            if translation.expression and translation.target_column_name:
+                df_ref = df_reference(cell.sheet)
+                lines.append(
+                    f"{df_ref}[{translation.target_column_name!r}] = {translation.expression}"
+                )
+            else:
+                lines.append("# Unable to translate derived column into pandas code.")
         else:
-            lines.append("# Unable to translate this formula into pandas code.")
+            if translation.expression:
+                lines.append(f"{identifier} = {translation.expression}")
+            else:
+                lines.append("# Unable to translate this formula into pandas code.")
         lines.append("")
 
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
